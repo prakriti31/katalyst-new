@@ -37,3 +37,5 @@ build/
 .env
 .env.*
 backend/.env
+
+backend/tokens.json

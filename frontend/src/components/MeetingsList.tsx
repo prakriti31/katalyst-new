@@ -1,12 +1,14 @@
 // frontend/src/components/MeetingsList.tsx
 import React, { useEffect, useState } from 'react';
-import { fetchEvents, Meeting } from '../api';
+import { fetchAllEvents, fetchEvents, Meeting } from '../api';
 import MeetingCard from './MeetingCard';
 import Loading from './Loading';
 
 export default function MeetingsList() {
   const [upcoming, setUpcoming] = useState<Meeting[] | null>(null);
   const [past, setPast] = useState<Meeting[] | null>(null);
+  const [upcomingEvents, setUpcomingEvents] = useState<Meeting[] | null>(null);
+  const [pastEvents, setPastEvents] = useState<Meeting[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [needAuth, setNeedAuth] = useState(false);
   const [summaries, setSummaries] = useState<Record<string,string>>({});
@@ -18,10 +20,16 @@ export default function MeetingsList() {
       setNeedAuth(false);
       setUpcoming(null);
       setPast(null);
+      setUpcomingEvents(null);
+      setPastEvents(null);
 
-      const [up, pa] = await Promise.all([fetchEvents('upcoming', 5), fetchEvents('past', 5)]);
-      setUpcoming(up);
-      setPast(pa);
+      const data = await fetchAllEvents();
+      // Meetings (with attendees)
+      setUpcoming(data.upcomingMeetings as any);
+      setPast(data.pastMeetings as any);
+      // All events
+      setUpcomingEvents(data.upcomingEvents as any);
+      setPastEvents(data.pastEvents as any);
     } catch (err: any) {
       // If backend returned not_authenticated, show connect flow
       if (err?.status === 401 || (err?.body && err.body?.error === 'not_authenticated')) {
@@ -70,7 +78,7 @@ export default function MeetingsList() {
   }
 
   if (error) return <div className="p-6 text-red-600">Error: {error}</div>;
-  if (!upcoming || !past) return <Loading message="Loading meetings..." />;
+  if (!upcoming || !past || !upcomingEvents || !pastEvents) return <Loading message="Loading events..." />;
 
   return (
     <div className="p-6 container mx-auto">
@@ -83,15 +91,23 @@ export default function MeetingsList() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <section>
-          <h2 className="text-xl font-semibold mb-3">Upcoming</h2>
+          <h2 className="text-xl font-semibold mb-3">Upcoming Meetings</h2>
           <div className="space-y-4">
             {upcoming.map(m => <MeetingCard key={m.id} meeting={m} />)}
-            {upcoming.length === 0 && <div className="text-slate-500">No upcoming events.</div>}
+            {upcoming.length === 0 && <div className="text-slate-500">No upcoming meetings.</div>}
           </div>
         </section>
 
         <section>
-          <h2 className="text-xl font-semibold mb-3">Past</h2>
+          <h2 className="text-xl font-semibold mb-3">Upcoming Events</h2>
+          <div className="space-y-4">
+            {upcomingEvents.map((m:any) => <MeetingCard key={(m.id||m.start)+m.title} meeting={m} />)}
+            {upcomingEvents.length === 0 && <div className="text-slate-500">No upcoming events.</div>}
+          </div>
+        </section>
+
+        <section>
+          <h2 className="text-xl font-semibold mb-3">Past Meetings</h2>
           <div className="space-y-4">
             {past.map(m => (
               <div key={m.id}>
@@ -99,7 +115,15 @@ export default function MeetingsList() {
                 {summaries[m.id] && <div className="mt-2 p-3 bg-slate-50 border rounded text-sm whitespace-pre-wrap">{summaries[m.id]}</div>}
               </div>
             ))}
-            {past.length === 0 && <div className="text-slate-500">No past events.</div>}
+            {past.length === 0 && <div className="text-slate-500">No past meetings.</div>}
+          </div>
+        </section>
+
+        <section>
+          <h2 className="text-xl font-semibold mb-3">Past Events</h2>
+          <div className="space-y-4">
+            {pastEvents.map((m:any) => <MeetingCard key={(m.id||m.start)+m.title} meeting={m} />)}
+            {pastEvents.length === 0 && <div className="text-slate-500">No past events.</div>}
           </div>
         </section>
       </div>

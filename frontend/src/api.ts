@@ -41,6 +41,16 @@ export async function fetchEvents(direction: 'past' | 'upcoming', limit = 5) {
   }
 }
 
+export async function fetchAllEvents() {
+  const resp = await AX.get('/api/calendar/all-events');
+  return resp.data as {
+    upcomingMeetings: any[];
+    upcomingEvents: any[];
+    pastMeetings: any[];
+    pastEvents: any[];
+  };
+}
+
 export async function summarizeMeeting(meeting: Meeting) {
   const resp = await AX.post(`/api/summarize`, { meeting });
   return resp.data;

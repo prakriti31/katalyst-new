@@ -9,11 +9,13 @@ const session = require('express-session');
 const calendarRoutes = require('./routes/calendar');
 const authRoutes = require('./routes/auth');
 const { google } = require('googleapis');
+const { listEvents } = require('./services/googleCalendar');
 
 const app = express();
 
 const TOKEN_PATH = path.resolve(process.cwd(), 'tokens.json');
-const PORT = process.env.PORT || 4001;
+const PORT = process.env.PORT || 4000;
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 
 // CORS: allow frontend origin and credentials
 app.use(cors({
@@ -81,11 +83,32 @@ app.get('/auth/url', (req, res) => {
   }
 });
 
-// 2) OAuth2 callback — exchange code for tokens, save tokens, and list upcoming events (plain text)
+// Convenience redirect endpoint for frontend links
+app.get('/auth/google', (req, res) => {
+  try {
+    const oauth2Client = createOAuthClient();
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: [
+        'https://www.googleapis.com/auth/calendar.events.readonly',
+        'openid',
+        'email',
+        'profile'
+      ],
+      prompt: 'consent'
+    });
+    res.redirect(url);
+  } catch (err) {
+    console.error('/auth/google error', err);
+    res.status(500).type('text/plain').send('Failed to initiate Google OAuth');
+  }
+});
+
+// 2) OAuth2 callback — exchange code for tokens, save tokens, and return JSON with all four categories
 app.get('/oauth2callback', async (req, res) => {
   const code = req.query.code;
   if (!code) {
-    return res.status(400).type('text/plain').send('Missing code parameter in query');
+    return res.status(400).json({ error: 'missing_code' });
   }
 
   let oauth2Client;
@@ -109,36 +132,17 @@ app.get('/oauth2callback', async (req, res) => {
       console.warn('Could not write tokens to file:', fsErr.message || fsErr);
     }
 
-    // Fetch upcoming events from primary calendar
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    const now = (new Date()).toISOString();
-    const eventsRes = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: now,
-      maxResults: 30,
-      singleEvents: true,
-      orderBy: 'startTime'
-    });
-    const events = eventsRes.data.items || [];
+    // Return full JSON categories so caller immediately sees four arrays
+    const nowIso = new Date().toISOString();
+    const pastMin = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString();
+    const futureMax = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
 
-    // Build plain-text output (you said everything is plain text)
-    let out = `Tokens saved to session and (dev) ${TOKEN_PATH}\n\nUpcoming events:\n\n`;
-    if (!events.length) {
-      out += 'No upcoming events found.\n';
-    } else {
-      for (const ev of events) {
-        const start = ev.start?.dateTime || ev.start?.date || '(no start)';
-        const summary = ev.summary || '(no title)';
-        out += `${start} — ${summary}\n`;
-      }
-    }
-
-    // Send as plain text so curl or CLI can read it easily
-    res.type('text/plain').send(out);
+    // Redirect to the frontend with an auth flag; frontend will fetch all categories
+    return res.redirect(`${FRONTEND_ORIGIN}/?authed=1`);
   } catch (err) {
     console.error('Error exchanging code or fetching events:', err);
     // If code already used or expired you'll often see invalid_grant here
-    res.status(500).type('text/plain').send('OAuth exchange or calendar fetch failed: ' + (err.message || err));
+    res.status(500).json({ error: 'oauth_exchange_failed', details: err.message || String(err) });
   }
 });
 

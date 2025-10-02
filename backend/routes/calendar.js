@@ -8,87 +8,132 @@
  */
 const express = require('express');
 const router = express.Router();
+const { listEvents } = require('../services/googleCalendar');
 const { google } = require('googleapis');
 
-function createOAuthClientFromSession(req) {
-  const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-  const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-  const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:4000/auth/oauth2callback';
-
-  const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-
-  // Pull tokens from session
-  if (!req.session || !req.session.tokens) {
-    return null;
+function buildWindow({ direction }) {
+  const nowIso = new Date().toISOString();
+  if (direction === 'past') {
+    // Limit to last 365 days to avoid massive responses
+    const oneYearAgoIso = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString();
+    return { timeMin: oneYearAgoIso, timeMax: nowIso };
   }
-  oauth2Client.setCredentials(req.session.tokens);
-  return oauth2Client;
+  // Upcoming: next 365 days
+  const oneYearAheadIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+  return { timeMin: nowIso, timeMax: oneYearAheadIso };
 }
 
-async function callGoogleCalendar(req, { timeMin, timeMax, limit = 10 }) {
-  const oauth2Client = createOAuthClientFromSession(req);
-  if (!oauth2Client) throw { code: 401, message: 'not_authenticated' };
-
-  const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-  const resp = await calendar.events.list({
-    calendarId: 'primary',
-    timeMin,
-    timeMax,
-    maxResults: limit,
-    singleEvents: true,
-    orderBy: 'startTime'
-  });
-
-  const items = resp.data.items || [];
-  const events = items.map(e => {
-    const start = e.start?.dateTime || e.start?.date || null;
-    const end = e.end?.dateTime || e.end?.date || null;
-    const attendees = (e.attendees || []).map(a => a.email).filter(Boolean);
-    return {
-      id: e.id,
-      title: e.summary || 'No title',
-      start,
-      end,
-      durationMinutes: start && end ? Math.round((new Date(end) - new Date(start)) / 60000) : 0,
-      attendees,
-      description: e.description || '',
-      calendarId: e.organizer?.email || 'primary'
-    };
-  });
-
-  return { events };
+function ok(json) {
+  return json;
 }
 
-router.get('/events', async (req, res) => {
+function handleError(res, err, fallbackCode = 500, fallbackMessage = 'calendar_error') {
+  const status = err?.statusCode || err?.code || fallbackCode;
+  if (status === 401) {
+    return res.status(401).json({ error: 'not_authenticated', message: 'Connect Google Calendar' });
+  }
+  const details = err?.message || String(err);
+  return res.status(status >= 400 && status < 600 ? status : fallbackCode).json({ error: fallbackMessage, details });
+}
+
+// GET /api/calendar/upcoming-meetings
+router.get('/upcoming-meetings', async (req, res) => {
   try {
-    const direction = req.query.direction === 'past' ? 'past' : 'upcoming';
-    const limit = parseInt(req.query.limit || '10', 10);
-    const now = new Date().toISOString();
-
-    let timeMin, timeMax;
-    if (direction === 'past') {
-      timeMax = now;
-      timeMin = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
-    } else {
-      timeMin = now;
-      timeMax = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
-    }
-
-    // MUST use Google Calendar — no fallback to mock data
-    const data = await callGoogleCalendar(req, { timeMin, timeMax, limit });
-    const events = (data.events || []).slice(0, limit);
-
-    // sort (Google already orders by startTime for upcoming; keep consistent)
-    events.sort((a, b) => direction === 'past' ? new Date(b.start) - new Date(a.start) : new Date(a.start) - new Date(b.start));
-    res.json({ events });
+    const { timeMin, timeMax } = buildWindow({ direction: 'upcoming' });
+    const events = await listEvents(req, { timeMin, timeMax, maxResults: 250, requireAttendees: true });
+    res.json(ok(events));
   } catch (err) {
-    console.error('calendar error', err?.message || err);
-    if (err && err.code === 401) {
-      return res.status(401).json({ error: 'not_authenticated', message: 'Connect Google Calendar' });
-    }
-    res.status(500).json({ error: 'events_fetch_failed', details: err?.message || String(err) });
+    handleError(res, err, 500, 'upcoming_meetings_failed');
+  }
+});
+
+// GET /api/calendar/upcoming-events
+router.get('/upcoming-events', async (req, res) => {
+  try {
+    const { timeMin, timeMax } = buildWindow({ direction: 'upcoming' });
+    const events = await listEvents(req, { timeMin, timeMax, maxResults: 250, requireAttendees: false });
+    res.json(ok(events));
+  } catch (err) {
+    handleError(res, err, 500, 'upcoming_events_failed');
+  }
+});
+
+// GET /api/calendar/past-meetings
+router.get('/past-meetings', async (req, res) => {
+  try {
+    const { timeMin, timeMax } = buildWindow({ direction: 'past' });
+    const events = await listEvents(req, { timeMin, timeMax, maxResults: 250, requireAttendees: true });
+    res.json(ok(events));
+  } catch (err) {
+    handleError(res, err, 500, 'past_meetings_failed');
+  }
+});
+
+// GET /api/calendar/past-events
+router.get('/past-events', async (req, res) => {
+  try {
+    const { timeMin, timeMax } = buildWindow({ direction: 'past' });
+    const events = await listEvents(req, { timeMin, timeMax, maxResults: 250, requireAttendees: false });
+    res.json(ok(events));
+  } catch (err) {
+    handleError(res, err, 500, 'past_events_failed');
   }
 });
 
 module.exports = router;
+
+/**
+ * GET /api/calendar/all-events
+ *
+ * Aggregates events into four categories using Google Calendar via `googleapis`:
+ * - upcomingMeetings: events starting now or later that include attendees
+ * - upcomingEvents:   events starting now or later (all events)
+ * - pastMeetings:     events that ended before now and include attendees
+ * - pastEvents:       events that ended before now (all events)
+ *
+ * Uses session tokens (preferred) or tokens.json fallback and auto-refresh.
+ * Returns 401 if not authenticated.
+ */
+router.get('/all-events', async (req, res) => {
+  const nowIso = new Date().toISOString();
+
+  function windowFor(direction) {
+    if (direction === 'past') {
+      const oneYearAgoIso = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString();
+      return { timeMin: oneYearAgoIso, timeMax: nowIso };
+    }
+    const oneYearAheadIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+    return { timeMin: nowIso, timeMax: oneYearAheadIso };
+  }
+
+  try {
+    const upcomingWindow = windowFor('upcoming');
+    const pastWindow = windowFor('past');
+
+    // Fetch in parallel for performance
+    const [
+      upcomingMeetings,
+      upcomingEvents,
+      pastMeetings,
+      pastEvents
+    ] = await Promise.all([
+      listEvents(req, { ...upcomingWindow, maxResults: 250, requireAttendees: true }),
+      listEvents(req, { ...upcomingWindow, maxResults: 250, requireAttendees: false }),
+      listEvents(req, { ...pastWindow, maxResults: 250, requireAttendees: true }),
+      listEvents(req, { ...pastWindow, maxResults: 250, requireAttendees: false })
+    ]);
+
+    return res.json({
+      upcomingMeetings,
+      upcomingEvents,
+      pastMeetings,
+      pastEvents
+    });
+  } catch (err) {
+    const status = err?.statusCode || err?.code || 500;
+    if (status === 401) {
+      return res.status(401).json({ error: 'not_authenticated', message: 'Connect Google Calendar' });
+    }
+    return res.status(500).json({ error: 'all_events_failed', details: err?.message || String(err) });
+  }
+});

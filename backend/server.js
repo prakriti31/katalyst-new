@@ -1,17 +1,23 @@
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const session = require('express-session');
 const calendarRoutes = require('./routes/calendar');
 const authRoutes = require('./routes/auth');
+const { google } = require('googleapis');
 
 const app = express();
 
+const TOKEN_PATH = path.resolve(process.cwd(), 'tokens.json');
+const PORT = process.env.PORT || 4001;
+
 // CORS: allow frontend origin and credentials
 app.use(cors({
-  origin: 'http://localhost:5173', // Vite frontend
+  origin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173', // Vite frontend
   credentials: true
 }));
 
@@ -31,13 +37,128 @@ app.use(session({
 
 app.get('/', (req, res) => res.json({ ok: true, name: 'Katalyst MCP Demo Backend' }));
 
-// Auth / OAuth routes
+// Auth / OAuth routes (legacy or additional auth-specific routes)
 app.use('/auth', authRoutes);
 
 // Calendar endpoints (calls MCP or Google Calendar if signed in)
 app.use('/api/calendar', calendarRoutes);
 
-// Summarize endpoint
+// ---------- Google OAuth helpers & endpoints ----------
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/oauth2callback`;
+
+function createOAuthClient() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    throw new Error('Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in env');
+  }
+  return new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    REDIRECT_URI
+  );
+}
+
+// 1) Generate auth URL (open in browser to start OAuth)
+app.get('/auth/url', (req, res) => {
+  try {
+    const oauth2Client = createOAuthClient();
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: [
+        'https://www.googleapis.com/auth/calendar.events.readonly',
+        'openid',
+        'email',
+        'profile'
+      ],
+      prompt: 'consent'
+    });
+    res.json({ url });
+  } catch (err) {
+    console.error('/auth/url error', err);
+    res.status(500).json({ error: 'failed_to_generate_auth_url', details: err.message || err });
+  }
+});
+
+// 2) OAuth2 callback — exchange code for tokens, save tokens, and list upcoming events (plain text)
+app.get('/oauth2callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).type('text/plain').send('Missing code parameter in query');
+  }
+
+  let oauth2Client;
+  try {
+    oauth2Client = createOAuthClient();
+  } catch (err) {
+    console.error('OAuth client creation failed:', err);
+    return res.status(500).type('text/plain').send('Server misconfiguration: missing Google client credentials');
+  }
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Save tokens to session and file (file only for dev convenience)
+    req.session.tokens = tokens;
+    try {
+      fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
+      console.log('Saved tokens to', TOKEN_PATH);
+    } catch (fsErr) {
+      console.warn('Could not write tokens to file:', fsErr.message || fsErr);
+    }
+
+    // Fetch upcoming events from primary calendar
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    const now = (new Date()).toISOString();
+    const eventsRes = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: now,
+      maxResults: 30,
+      singleEvents: true,
+      orderBy: 'startTime'
+    });
+    const events = eventsRes.data.items || [];
+
+    // Build plain-text output (you said everything is plain text)
+    let out = `Tokens saved to session and (dev) ${TOKEN_PATH}\n\nUpcoming events:\n\n`;
+    if (!events.length) {
+      out += 'No upcoming events found.\n';
+    } else {
+      for (const ev of events) {
+        const start = ev.start?.dateTime || ev.start?.date || '(no start)';
+        const summary = ev.summary || '(no title)';
+        out += `${start} — ${summary}\n`;
+      }
+    }
+
+    // Send as plain text so curl or CLI can read it easily
+    res.type('text/plain').send(out);
+  } catch (err) {
+    console.error('Error exchanging code or fetching events:', err);
+    // If code already used or expired you'll often see invalid_grant here
+    res.status(500).type('text/plain').send('OAuth exchange or calendar fetch failed: ' + (err.message || err));
+  }
+});
+
+// 3) Logout / clear session & token file (dev)
+app.get('/auth/logout', (req, res) => {
+  try {
+    req.session.destroy(err => {
+      if (err) console.warn('Session destroy error:', err);
+    });
+    if (fs.existsSync(TOKEN_PATH)) {
+      try { fs.unlinkSync(TOKEN_PATH); } catch (e) { /* ignore */ }
+    }
+    res.json({ ok: true, message: 'logged_out' });
+  } catch (err) {
+    console.error('Logout error', err);
+    res.status(500).json({ error: 'logout_failed' });
+  }
+});
+
+// ---------- Summarize endpoint (kept, small improvements) ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 app.post('/api/summarize', async (req, res) => {
@@ -50,6 +171,7 @@ app.post('/api/summarize', async (req, res) => {
       return res.json({ summary: mock, source: 'mock' });
     }
 
+    // Use official OpenAI JS client
     const OpenAI = require('openai');
     const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -63,6 +185,7 @@ Description: ${meeting.description || 'none'}
 
 Provide bullets and one action.`;
 
+    // Chat completion - depending on your openai package version, this should work:
     const completion = await client.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
@@ -77,5 +200,5 @@ Provide bullets and one action.`;
   }
 });
 
-const PORT = process.env.PORT || 4000;
+// Start server
 app.listen(PORT, () => console.log(`Backend running at http://localhost:${PORT}`));
